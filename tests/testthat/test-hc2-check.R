@@ -30,9 +30,6 @@ test_that("New implementation matches old", {
 MatSqrtInverse <- function(A) {
 
     ei <- eigen(A, symmetric=TRUE)
-    if (min(ei$values) <= 0)
-        warning("Gram matrix doesn't appear to be positive definite")
-
     d <- pmax(ei$values, 0)
     d2 <- 1/sqrt(d)
     d2[d == 0] <- 0
@@ -201,8 +198,9 @@ BMlmSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE) {
     expect_lt(max(abs(r$coefficients[, "df"]-rold$dof)), bigep)
     expect_lt(max(abs(r$coefficients[, "Adj. se"]-rold$adj.se)), ep)
     expect_lt(max(abs(r$coefficients[, "HC2 se"]-rold$se)), ep)
+    ## previously incorrectly 9.05e-37 for p-value
     expect_equal(capture.output(print(r, digits=3))[4],
-                 "(Intercept)     1.64  0.128  0.128    0.13 99 9.05e-37")
+                 "(Intercept)     1.64  0.128  0.128    0.13 99 9.18e-23")
 
     ## Noninvertible cases
     d0[[3]]$x.3 <- FALSE
@@ -216,6 +214,12 @@ BMlmSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE) {
     ## Fixed effects: here minimum eigenvalue is only numerically positive
     d0[[1]]$x <- c(rep(1, 4), rep(0, 5), 1)
     fm2 <- lm(y~x+cl, data=d0[[1]])
-    p <- dfadjustSE(fm2, d0[[1]]$cl)$coefficients[, "Adj. se"]
-    expect_lt(max(abs(BMlmSE(fm2, d0[[1]]$cl)$adj.se-p)), 1e-6)
+    p1 <- dfadjustSE(fm2, d0[[1]]$cl)
+    p2 <- BMlmSE(fm2, d0[[1]]$cl)
+    expect_lt(max(abs(p2$adj.se - p1$coefficients[, "Adj. se"])), 1e-6)
+
+    ## P-values
+    expect_equal(capture.output(print(p1, digits=3))[5],
+                 "x             -0.348  1.003  1.061    6.88  1   0.798")
+
 })
