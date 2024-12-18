@@ -3,10 +3,13 @@
 #' @param clustervar Factor variable that defines clusters. If \code{NULL} (or
 #'     not supplied), the command computes heteroscedasticity-robust standard
 #'     errors, rather than cluster-robust standard errors.
-#' @param ell A vector of the same length as the dimension of covariates,
-#'     specifying which linear combination \eqn{\ell'\beta}{ell'beta} of
-#'     coefficients \eqn{\beta}{beta} to compute. If \code{NULL}, compute
-#'     standard errors for each regressor coefficient.
+#' @param ell A vector specifying for which coefficients to compute the standard
+#'     errors. If \code{NULL}, compute standard errors for each regressor
+#'     coefficient. If \code{ell} consists of integers and its length is smaller
+#'     than the number of regressors, compute standard errors for those
+#'     coefficients. If the vector has the same length as the dimension of
+#'     regressors, compute standard error for the linear combination
+#'     \eqn{\ell'\beta}{ell'beta} of coefficients \eqn{\beta}{beta}.
 #' @param IK Only relevant for cluster-robust standard errors. Specifies whether
 #'     to compute the degrees-of-freedom adjustment using the Imbens-Kolesár
 #'     (2016) method (if \code{TRUE}), or the Bell-McCaffrey (2002) method (if
@@ -56,23 +59,28 @@
 #' }
 #' @examples
 #' ## No clustering:
-#' set.seed(42)
 #' x <- sin(1:100)
-#' y <- rnorm(100)
+#' y <- 1:100
 #' fm <- lm(y ~ x + I(x^2))
 #' dfadjustSE(fm)
 #' ## Clustering, with 5 clusters
-#' clustervar <- as.factor(c(rep(1, 40), rep(1, 20),
+#' clustervar <- as.factor(c(rep(1, 40), rep(5, 20),
 #'                         rep(2, 20), rep(3, 10), rep(4, 10)))
 #' dfadjustSE(fm, clustervar)
+#' ## Only compute standard errors for the second coefficient
+#' dfadjustSE(fm, clustervar, ell=2)
+#' ## Compute standard error for the sum of second and third coefficient
+#' dfadjustSE(fm, clustervar, ell=c(0, 1, 1))
 #' @export
 dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
                        rho0=FALSE) {
-    Q <- qr.Q(model$qr)
-    R <- qr.R(model$qr)
+    K <- model$rank
+    idx <- model$qr$pivot[seq.int(model$qr$rank)]
+    Q <- qr.Q(model$qr)[, seq.int(K), drop=FALSE]
+    R <- qr.R(model$qr)[seq.int(K), seq.int(K), drop=FALSE]
     n <- NROW(Q)
     u <- stats::residuals(model)
-    K <- model$rank
+
     ## Moulton estimates
     rho <- sig <- NA
 
@@ -80,7 +88,7 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
 
     ## no clustering
     if (is.null(clustervar)) {
-        ## Compute meat of HC1 and HC2
+        ## Compute meat of HC1 and HC2. Hatvalues scale invariant
         diaghat <- try(stats::hatvalues(model), silent = TRUE)
         AQ <- (1-diaghat >= tol) * (1/sqrt(pmax(1-diaghat, tol))) * Q
         HC2 <- crossprod(u * AQ)
@@ -94,7 +102,9 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
                 (sum(a^4)-2*sum((a*B)^2)+sum(crossprod(B)^2))
         }
     } else {
-        if (!is.factor(clustervar)) stop("'clustervar' must be a factor")
+        if (!is.factor(clustervar) || length(clustervar) != n) {
+            stop("'clustervar' must be a factor with length n")
+        }
         ## Order u, Q by clusters
         ord <- order(clustervar)
         u <- u[ord]
@@ -103,19 +113,22 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
 
         ## Compute meat of HC1 and HC2
         S <- nlevels(clustervar) # number of clusters
-        uj <- apply(u*Q, 2, function(x) tapply(x, clustervar, sum))
+
+        grp <- collapse::GRP(clustervar)
+        uj <- collapse::fsum(u*Q, grp)
         HC1 <- S / (S-1) * (n-1) / (n-K) * crossprod(uj)
-        ## A_s * Q_s
+        ## A_s * Q_s; Q matrix scale invariant
         AQf <- function(s) {
             Qs <- Q[clustervar==s, , drop=FALSE] # nolint
-            e <- eigen(crossprod(Qs))
+            e <- eigen(crossprod(Qs), symmetric=TRUE)
             Ds <-  (1-e$values >= tol) *
                 (1/sqrt(pmax(1-e$values, tol))) * t(e$vectors)
             Qs %*% e$vectors %*% Ds
         }
+
         AQ <- lapply(levels(clustervar), AQf) # list of matrices
         AQ <- do.call(rbind, AQ)
-        uj <- apply(u*AQ, 2, function(x) tapply(x, clustervar, sum))
+        uj <- collapse::fsum(u*AQ, grp)
         HC2 <- crossprod(uj)
 
         if (IK) {
@@ -124,7 +137,7 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
             den <- sum(tapply(u, clustervar, length)^2)-n
             rho <- 0
             if (den>0)
-                rho <- (sum(tapply(u, clustervar, sum)^2)-ssr) / den
+                rho <- (sum(collapse::fsum(u, grp)^2)-ssr) / den
 
             ## Don't allow for negative correlation
             if (rho0) rho <- max(rho, 0)
@@ -133,14 +146,14 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
 
         df0 <- function(ell) {
             a <-  drop(AQ %*% backsolve(R, ell, transpose=TRUE))
-            as <- as.vector(tapply(a^2, clustervar, sum))
-            B  <- apply(a*Q, 2, function(x) tapply(x, clustervar, sum))
+            as <- collapse::fsum(a^2, grp)
+            B <- collapse::fsum(a*Q, grp)
             if (!IK) {
                 (sum(as)-sum(B^2))^2 /
                     (sum(as^2)-2*sum(as*B^2)+sum(crossprod(B)^2))
             } else {
-                D <- as.vector(tapply(a, clustervar, sum))
-                Fm  <- apply(Q, 2, function(x) tapply(x, clustervar, sum))
+                D <- collapse::fsum(a, grp)
+                Fm <- collapse::fsum(Q, grp)
                 GG <- sig * (diag(as)-tcrossprod(B)) +
                     rho*tcrossprod(diag(D)-tcrossprod(B, Fm))
                 sum(diag(GG))^2 / sum(GG^2)
@@ -150,17 +163,23 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
 
     Vhat <- sandwich(HC2)
     VhatStata <- sandwich(HC1)
-
-    if (!is.null(ell)) {
+    if (length(ell) == length(model$qr$pivot)) {
+        ell <- ell[idx]
         se <- drop(sqrt(crossprod(ell, Vhat) %*% ell))
         dof <- df0(ell)
         seStata <- drop(sqrt(crossprod(ell, VhatStata) %*% ell))
         beta <- sum(ell*model$coefficients)
     } else {
-        se <- sqrt(diag(Vhat))
-        dof <- vapply(seq(K), function(k) df0(diag(K)[, k]), numeric(1))
-        seStata <- sqrt(diag(VhatStata))
-        beta <-  model$coefficients
+        if (!is.null(ell)) {
+            ell <- (seq_along(model$qr$pivot) %in% ell)[idx]
+            ell <- which(ell)
+        } else {
+            ell <- seq(K)
+        }
+        se <- sqrt(diag(Vhat))[ell]
+        dof <- vapply(ell, function(k) df0(diag(K)[, k]), numeric(1))
+        seStata <- sqrt(diag(VhatStata))[ell]
+        beta <-  model$coefficients[idx][ell]
     }
 
     r <- cbind("Estimate"=beta,
@@ -168,8 +187,7 @@ dfadjustSE <- function(model, clustervar=NULL, ell=NULL, IK=TRUE, tol=1e-9,
                "HC2 se"=se,
                "Adj. se"=se*stats::qt(0.975, df=dof)/stats::qnorm(0.975),
                "df"=dof)
-    rownames(r) <- names(beta)
-    colnames(Vhat) <- rownames(Vhat) <- names(model$coefficients)
+    colnames(Vhat) <- rownames(Vhat) <- names(model$coefficients[idx])
 
     structure(list(vcov=Vhat, coefficients=r,
                    rho=rho, sig=sig), class="dfadjustSE")
